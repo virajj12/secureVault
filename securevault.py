@@ -24,18 +24,37 @@ def load_or_generate_key():
 MASTER_KEY = load_or_generate_key()
 cipher = Fernet(MASTER_KEY)
 
+# 1.5 Salt for HMAC (to prevent rainbow table attacks on trapdoors)
+#  HMAC (can be stored in code or env variable)
+
+SALT_FILE = "salt.bin"
+
+def load_or_generate_salt():
+    if not os.path.exists(SALT_FILE):
+        salt = os.urandom(16)  # 128-bit salt
+        with open(SALT_FILE, "wb") as f:
+            f.write(salt)
+    else:
+        with open(SALT_FILE, "rb") as f:
+            salt = f.read()
+    return salt
+
+SALT = load_or_generate_salt()
 
 # 2. Secure Trapdoor (HMAC-based)
 
 def generate_trapdoor(word: str) -> str:
     """
-    HMAC-based trapdoor generation.
-    Stronger than simple SHA-256(secret + word).
-    Prevents length-extension attacks.
-    Deterministic for searchable encryption.
+    Salted HMAC-based trapdoor.
+    Deterministic but protected against rainbow-table attacks.
     """
+
     normalized = word.lower().strip().encode()
-    return hmac.new(MASTER_KEY, normalized, hashlib.sha256).hexdigest()
+
+    # Combine salt + word before HMAC
+    salted_word = SALT + normalized
+
+    return hmac.new(MASTER_KEY, salted_word, hashlib.sha256).hexdigest()
 
 
 # 3. Database Initialization
@@ -46,7 +65,7 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS data_store (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            acc_no TEXT PRIMARY KEY,
             payload BLOB
         )
     """)
@@ -54,11 +73,10 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS search_index (
             trapdoor TEXT,
-            data_id INTEGER
+            acc_no TEXT
         )
     """)
 
-    # Performance Optimization
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_trapdoor
         ON search_index(trapdoor)
@@ -73,11 +91,19 @@ def init_db():
 def insert_record(conn, record: dict):
     cursor = conn.cursor()
 
-    # Encryption at Rest
+    acc_no = record["acc_no"]
+
+    # Encrypt entire record
     encrypted_blob = cipher.encrypt(json.dumps(record).encode())
 
-    cursor.execute("INSERT INTO data_store (payload) VALUES (?)", (encrypted_blob,))
-    record_id = cursor.lastrowid
+    try:
+        cursor.execute(
+            "INSERT INTO data_store (acc_no, payload) VALUES (?, ?)",
+            (acc_no, encrypted_blob)
+        )
+    except sqlite3.IntegrityError:
+        st.error("Account number already exists!")
+        return
 
     # Index searchable fields
     terms = record["name"].split() + [record["acc_no"]]
@@ -85,8 +111,8 @@ def insert_record(conn, record: dict):
     for term in set(terms):
         trapdoor = generate_trapdoor(term)
         cursor.execute(
-            "INSERT INTO search_index (trapdoor, data_id) VALUES (?, ?)",
-            (trapdoor, record_id)
+            "INSERT INTO search_index (trapdoor, acc_no) VALUES (?, ?)",
+            (trapdoor, acc_no)
         )
 
     conn.commit()
@@ -102,7 +128,7 @@ def search_records(conn, query: str):
     cursor.execute("""
         SELECT ds.payload
         FROM data_store ds
-        JOIN search_index si ON ds.id = si.data_id
+        JOIN search_index si ON ds.acc_no = si.acc_no
         WHERE si.trapdoor = ?
     """, (trapdoor,))
 
@@ -110,7 +136,6 @@ def search_records(conn, query: str):
 
     results = []
     for row in rows:
-        # Decrypt only matched records (not entire DB)
         decrypted = cipher.decrypt(row[0])
         results.append(json.loads(decrypted.decode()))
 
