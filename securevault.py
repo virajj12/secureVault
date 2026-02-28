@@ -3,35 +3,66 @@ import sqlite3
 import json
 import hmac
 import hashlib
+import logging
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
 import streamlit as st
 
+# =====================================================
+# CONFIGURATION & LOGGING
+# =====================================================
 
-# 1. Key Management
+logging.basicConfig(
+    filename="securevault.log",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-KEY_FILE = "secret.key"
+DB_FILE = "securevault.db"
+ROOT_KEY_FILE = "root.key"
+SALT_FILE = "salt.bin"
 
-def load_or_generate_key():
-    if not os.path.exists(KEY_FILE):
-        key = Fernet.generate_key()
-        with open(KEY_FILE, "wb") as f:
+# =====================================================
+# KEY HIERARCHY (Industry Standard)
+# =====================================================
+
+def load_or_generate_root_key():
+    if not os.path.exists(ROOT_KEY_FILE):
+        key = os.urandom(32)
+        with open(ROOT_KEY_FILE, "wb") as f:
             f.write(key)
     else:
-        with open(KEY_FILE, "rb") as f:
+        with open(ROOT_KEY_FILE, "rb") as f:
             key = f.read()
     return key
 
-MASTER_KEY = load_or_generate_key()
-cipher = Fernet(MASTER_KEY)
+ROOT_KEY = load_or_generate_root_key()
 
-# 1.5 Salt for HMAC (to prevent rainbow table attacks on trapdoors)
-#  HMAC (can be stored in code or env variable)
+def derive_key(context: bytes) -> bytes:
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=context,
+        backend=default_backend()
+    )
+    return hkdf.derive(ROOT_KEY)
 
-SALT_FILE = "salt.bin"
+K_ENC = derive_key(b"encryption-key")
+K_TD  = derive_key(b"trapdoor-key")
+K_IDX = derive_key(b"index-integrity-key")
+
+cipher = Fernet(base64_urlsafe_key := Fernet.generate_key())
+
+# =====================================================
+# SALT MANAGEMENT
+# =====================================================
 
 def load_or_generate_salt():
     if not os.path.exists(SALT_FILE):
-        salt = os.urandom(16)  # 128-bit salt
+        salt = os.urandom(16)
         with open(SALT_FILE, "wb") as f:
             f.write(salt)
     else:
@@ -39,28 +70,23 @@ def load_or_generate_salt():
             salt = f.read()
     return salt
 
-SALT = load_or_generate_salt()
+GLOBAL_SALT = load_or_generate_salt()
 
-# 2. Secure Trapdoor (HMAC-based)
+# =====================================================
+# SECURE TRAPDOOR (Blind Index)
+# =====================================================
 
 def generate_trapdoor(word: str) -> str:
-    """
-    Salted HMAC-based trapdoor.
-    Deterministic but protected against rainbow-table attacks.
-    """
-
     normalized = word.lower().strip().encode()
+    data = GLOBAL_SALT + normalized
+    return hmac.new(K_TD, data, hashlib.sha256).hexdigest()
 
-    # Combine salt + word before HMAC
-    salted_word = SALT + normalized
-
-    return hmac.new(MASTER_KEY, salted_word, hashlib.sha256).hexdigest()
-
-
-# 3. Database Initialization
+# =====================================================
+# DATABASE LAYER
+# =====================================================
 
 def init_db():
-    conn = sqlite3.connect("securevault.db")
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -85,16 +111,21 @@ def init_db():
     conn.commit()
     return conn
 
+# =====================================================
+# SERVICE LAYER
+# =====================================================
 
-# 4. Insert Encrypted Record
+def encrypt_payload(record: dict) -> bytes:
+    return cipher.encrypt(json.dumps(record).encode())
+
+def decrypt_payload(blob: bytes) -> dict:
+    return json.loads(cipher.decrypt(blob).decode())
 
 def insert_record(conn, record: dict):
     cursor = conn.cursor()
-
     acc_no = record["acc_no"]
 
-    # Encrypt entire record
-    encrypted_blob = cipher.encrypt(json.dumps(record).encode())
+    encrypted_blob = encrypt_payload(record)
 
     try:
         cursor.execute(
@@ -102,11 +133,10 @@ def insert_record(conn, record: dict):
             (acc_no, encrypted_blob)
         )
     except sqlite3.IntegrityError:
-        st.error("Account number already exists!")
-        return
+        logging.warning("Duplicate account insertion attempt")
+        raise
 
-    # Index searchable fields
-    terms = record["name"].split() + [record["acc_no"]]
+    terms = record["name"].split() + [acc_no]
 
     for term in set(terms):
         trapdoor = generate_trapdoor(term)
@@ -116,13 +146,10 @@ def insert_record(conn, record: dict):
         )
 
     conn.commit()
-
-
-# 5. Secure Search
+    logging.info("Inserted record securely")
 
 def search_records(conn, query: str):
     cursor = conn.cursor()
-
     trapdoor = generate_trapdoor(query)
 
     cursor.execute("""
@@ -136,92 +163,45 @@ def search_records(conn, query: str):
 
     results = []
     for row in rows:
-        decrypted = cipher.decrypt(row[0])
-        results.append(json.loads(decrypted.decode()))
+        results.append(decrypt_payload(row[0]))
 
+    logging.info("Search performed securely")
     return results
 
+# =====================================================
+# STREAMLIT UI
+# =====================================================
 
-# 6. Streamlit UI
-
-st.set_page_config(page_title="SecureVault", layout="wide")
-st.title("SecureVault - Searchable Encryption System")
+st.set_page_config(page_title="SecureVault Enterprise", layout="wide")
+st.title("SecureVault Enterprise - Industry Grade Secure Search")
 
 conn = init_db()
 
-# Sample data
-customers = [
-    {"name": "Aarav Sharma", "acc_no": "20001", "balance": "7500"},
-    {"name": "Diya Patel", "acc_no": "20002", "balance": "12000"},
-    {"name": "Rohan Mehta", "acc_no": "20003", "balance": "5600"},
-    {"name": "Ananya Iyer", "acc_no": "20004", "balance": "9800"},
-    {"name": "Kabir Singh", "acc_no": "20005", "balance": "1500"},
-    {"name": "Meera Nair", "acc_no": "20006", "balance": "6400"},
-    {"name": "Arjun Reddy", "acc_no": "20007", "balance": "22000"},
-    {"name": "Sneha Kulkarni", "acc_no": "20008", "balance": "3400"},
-    {"name": "Vikram Rao", "acc_no": "20009", "balance": "8800"},
-    {"name": "Ishita Verma", "acc_no": "20010", "balance": "4300"},
-    {"name": "Rahul Das", "acc_no": "20011", "balance": "17000"},
-    {"name": "Pooja Menon", "acc_no": "20012", "balance": "3900"},
-    {"name": "Nikhil Jain", "acc_no": "20013", "balance": "8100"},
-    {"name": "Kavya Shetty", "acc_no": "20014", "balance": "2600"},
-    {"name": "Aditya Kapoor", "acc_no": "20015", "balance": "9900"},
-    {"name": "Tanya Bhat", "acc_no": "20016", "balance": "5400"},
-    {"name": "Siddharth Malhotra", "acc_no": "20017", "balance": "12500"},
-    {"name": "Neha Agarwal", "acc_no": "20018", "balance": "7100"},
-    {"name": "Yash Thakur", "acc_no": "20019", "balance": "600"},
-    {"name": "Ritika Sinha", "acc_no": "20020", "balance": "14300"},
-    {"name": "Manish Choudhary", "acc_no": "20021", "balance": "4700"},
-    {"name": "Shruti Desai", "acc_no": "20022", "balance": "8300"},
-    {"name": "Karan Oberoi", "acc_no": "20023", "balance": "11200"},
-    {"name": "Bhavna Rao", "acc_no": "20024", "balance": "2900"},
-    {"name": "Harsh Vardhan", "acc_no": "20025", "balance": "5200"},
-    {"name": "Divya Joshi", "acc_no": "20026", "balance": "4600"},
-    {"name": "Pranav Kulkarni", "acc_no": "20027", "balance": "15000"},
-    {"name": "Aishwarya Pillai", "acc_no": "20028", "balance": "9200"},
-    {"name": "Gaurav Mishra", "acc_no": "20029", "balance": "6800"},
-    {"name": "Sanya Kapoor", "acc_no": "20030", "balance": "10400"}
-]
-
-def preload_data(conn):
-    for record in customers:
-        insert_record(conn, record)
-
-if st.sidebar.button("Load Demo Data (30 Records)"):
-    preload_data(conn)
-    st.sidebar.success("30 demo records securely inserted!")
-
-st.sidebar.header("Add Record")
+st.sidebar.header("Add Secure Record")
 
 name = st.sidebar.text_input("Customer Name")
 acc_no = st.sidebar.text_input("Account Number")
 balance = st.sidebar.text_input("Balance")
 
 if st.sidebar.button("Store Securely"):
-    if name and acc_no and balance:
-        record = {
+    try:
+        insert_record(conn, {
             "name": name,
             "acc_no": acc_no,
             "balance": balance
-        }
-        insert_record(conn, record)
-        st.sidebar.success("Record encrypted and stored securely!")
-    else:
-        st.sidebar.warning("All fields required.")
+        })
+        st.success("Securely stored.")
+    except:
+        st.error("Account already exists.")
 
 st.header("Secure Search")
 
-search_term = st.text_input("Enter Name or Account Number")
+query = st.text_input("Search by Name or Account Number")
 
 if st.button("Search"):
-    if search_term:
-        results = search_records(conn, search_term)
-
-        if results:
-            st.success(f"{len(results)} match(es) found.")
-            for r in results:
-                st.json(r)
-        else:
-            st.error("No matches found.")
+    results = search_records(conn, query)
+    if results:
+        for r in results:
+            st.json(r)
     else:
-        st.warning("Enter search term.")
+        st.error("No results found.")
